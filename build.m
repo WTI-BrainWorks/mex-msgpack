@@ -1,13 +1,15 @@
 % build the static msgpack first from the submodule
-system('cmake -S msgpack-c -B build -DCMAKE_BUILD_TYPE=Release -DMSGPACK_ENABLE_STATIC=ON -DMSGPACK_ENABLE_SHARED=OFF');
+system(['cmake -S msgpack-c -B build -DCMAKE_BUILD_TYPE=Release ' ...
+        '-DCMAKE_INSTALL_PREFIX=./inst ' ...
+        '-DMSGPACK_ENABLE_STATIC=ON -DMSGPACK_ENABLE_SHARED=OFF -DMSGPACK_BUILD_EXAMPLES=OFF']);
 system('cmake --build build --config Release');
+system('cmake --install build');
 
 if ispc
     libfile = './build/Release/msgpack-c.lib';
 else
-    libfile = './build/libmsgpack-c.a';
+    libfile = './inst/lib/libmsgpack-c.a';
 % ismac (??)
 end
 
-mex('-I"./msgpack-c/include"', '-I"./build/include"', '-I"./build/include/msgpack"', ...
-    libfile, 'msgpack_mex.c', '-output', 'msgpack', '-outdir', './dist', '-R2018a');
+mex('-I"./inst/include"', libfile, 'msgpack_mex.c', '-output', './dist/msgpack', '-R2018a');

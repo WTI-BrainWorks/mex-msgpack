@@ -4,8 +4,8 @@ Given there's a pre-built libmsgpack somewhere...
 mex -I"./msgpack-c/include" msgpack_mex.c ./msgpack-c/libmsgpack-c.a -output msgpack -R2018a
 */
 
-#include "mex.h"
 #include "msgpack.h"
+#include "mex.h"
 #include <string.h>
 
 void pack_mxarray(msgpack_packer* pk, const mxArray* arr);

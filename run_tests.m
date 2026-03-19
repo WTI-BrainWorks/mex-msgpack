@@ -1,7 +1,7 @@
 
 function run_tests()
     tic;
-    for i = 1:1
+    for i = 1:100
         test_roundtrip(1);
         test_roundtrip([1,2,5]);
         test_roundtrip(struct('a', 1, 'b', 'c'));
