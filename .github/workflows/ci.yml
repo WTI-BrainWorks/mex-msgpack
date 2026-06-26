@@ -1,0 +1,141 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ----------------------------------------------------------------- MATLAB
+  matlab:
+    name: MATLAB ${{ matrix.release }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  release: latest }
+          - { os: windows-latest, release: latest }
+          # Older-MATLAB compatibility check. Pin `release` to the version your
+          # systems run; the runner is kept near that era so `mex` finds a
+          # supported compiler (old MATLAB + a brand-new MSVC/gcc can mismatch).
+          - { os: ubuntu-22.04,   release: R2021b }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MATLAB ${{ matrix.release }}
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          release: ${{ matrix.release }}
+
+      - name: Build MEX
+        uses: matlab-actions/run-command@v2
+        env:
+          MLM_LICENSE_TOKEN: ${{ secrets.MLM_LICENSE_TOKEN }}   # only needed for private repos
+        with:
+          command: build
+
+      - name: Run tests
+        uses: matlab-actions/run-command@v2
+        env:
+          MLM_LICENSE_TOKEN: ${{ secrets.MLM_LICENSE_TOKEN }}
+        with:
+          command: run_tests
+
+      - name: Upload MEX
+        uses: actions/upload-artifact@v4
+        with:
+          name: matlab-${{ matrix.release }}-${{ matrix.os }}
+          path: dist/msgpack.mex*
+          if-no-files-found: error
+
+  # ----------------------------------------------------- Octave (Linux, pinned)
+  # Builds inside the gnuoctave/octave images so the Octave version is exact and
+  # reproducible. 7.3.0 is the production target; 4.4.1 is the oldest we support
+  # (Psychtoolbox's floor); `latest` catches forward-compat breakage. We check
+  # out on the host and run the build via `docker run` (rather than a job-level
+  # `container:`) so the old 4.4.1 image's glibc doesn't have to satisfy the
+  # Node-based actions/checkout runtime.
+  octave-linux:
+    name: Octave ${{ matrix.octave }} / linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        octave: ['4.4.1', '7.3.0', 'latest']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build + test (Octave ${{ matrix.octave }})
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work gnuoctave/octave:${{ matrix.octave }} bash -c '
+            set -e
+            # The images ship gcc/g++/make but not cmake. The oldest (4.4.1 =
+            # Ubuntu 16.04) also has no python/pip and EOL apt repos, so neither
+            # the PyPI cmake wheel nor apt is reliable there. They do have
+            # curl/wget + tar, and the Kitware cmake binary needs only glibc 2.17,
+            # so fetch a pinned cmake whenever the image lacks one.
+            if ! command -v cmake >/dev/null 2>&1; then
+              v=3.29.0
+              url="https://github.com/Kitware/CMake/releases/download/v${v}/cmake-${v}-linux-x86_64.tar.gz"
+              mkdir -p /opt
+              if command -v curl >/dev/null 2>&1; then curl -fsSL "$url" -o /tmp/cmake.tgz; else wget -qO /tmp/cmake.tgz "$url"; fi
+              tar -xzf /tmp/cmake.tgz -C /opt
+              export PATH="/opt/cmake-${v}-linux-x86_64/bin:$PATH"
+            fi
+            cmake --version
+            octave --no-gui --eval "build"
+            octave --no-gui --eval "run_tests"
+          '
+
+      - name: Upload MEX
+        uses: actions/upload-artifact@v4
+        with:
+          name: octave-${{ matrix.octave }}-linux
+          path: dist/msgpack.mex
+          if-no-files-found: error
+
+  # --------------------------------------------------------- Octave (Windows)
+  # MSYS2 only ships the current Octave, so this isn't version-pinned; it guards
+  # the Windows/MinGW build path. (Linux above pins the production 7.3.0.)
+  octave-windows:
+    name: Octave / windows-latest
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2 / Octave
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-octave
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Build MEX
+        env:
+          MEX_CMAKE_GENERATOR: Ninja
+        run: octave --no-gui --eval "build"
+
+      - name: Run tests
+        run: octave --no-gui --eval "run_tests"
+
+      - name: Upload MEX
+        uses: actions/upload-artifact@v4
+        with:
+          name: octave-windows-latest
+          path: dist/msgpack.mex
+          if-no-files-found: error

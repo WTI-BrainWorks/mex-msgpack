@@ -1,7 +1,10 @@
 /*
 Given there's a pre-built libmsgpack somewhere...
 
-mex -I"./msgpack-c/include" msgpack_mex.c ./msgpack-c/libmsgpack-c.a -output msgpack -R2018a
+mex -I"./msgpack-c/include" msgpack_mex.c ./msgpack-c/libmsgpack-c.a -output msgpack
+
+Uses only the classic mx* API, so it builds on everything from Octave 4.4 to
+current MATLAB without -R2018a. See build.m for the full library + MEX build.
 */
 
 #include "msgpack.h"
@@ -17,6 +20,18 @@ void pack_mxarray(msgpack_packer* pk, const mxArray* arr) {
         return;
     }
 
+    // An empty array that isn't a string, cell, struct, or uint8 packs as nil,
+    // so [] round-trips to [] (nil decodes to an empty double). This also gives
+    // empty single/int arrays a sane encoding and fixes empty logical arrays,
+    // which otherwise emitted no bytes at all. uint8 (our binary type) keeps an
+    // empty bin, char an empty string, and cell an empty array -- each retains
+    // its class on decode.
+    if (mxGetNumberOfElements(arr) == 0 &&
+        !mxIsChar(arr) && !mxIsCell(arr) && !mxIsStruct(arr) && !mxIsUint8(arr)) {
+        msgpack_pack_nil(pk);
+        return;
+    }
+
     if (mxIsDouble(arr) && !mxIsComplex(arr)) {
         size_t num_elements = mxGetNumberOfElements(arr);
 
@@ -24,11 +39,22 @@ void pack_mxarray(msgpack_packer* pk, const mxArray* arr) {
             msgpack_pack_double(pk, mxGetScalar(arr));
         }
         else {
-            mxDouble* vals = mxGetDoubles(arr);
+            double* vals = (double*)mxGetData(arr);
             msgpack_pack_array(pk, num_elements);
             for (size_t i = 0; i < num_elements; i++) {
                 msgpack_pack_double(pk, (double)vals[i]);
             }
+        }
+    }
+    else if (mxIsSingle(arr) && !mxIsComplex(arr)) {
+        size_t num_elements = mxGetNumberOfElements(arr);
+        float* vals = (float*)mxGetData(arr);
+
+        if (num_elements != 1) {
+            msgpack_pack_array(pk, num_elements);
+        }
+        for (size_t i = 0; i < num_elements; i++) {
+            msgpack_pack_float(pk, vals[i]);
         }
     }
     else if (mxIsChar(arr)) {
@@ -38,6 +64,10 @@ void pack_mxarray(msgpack_packer* pk, const mxArray* arr) {
             msgpack_pack_str(pk, len);
             msgpack_pack_str_body(pk, str, len);
             mxFree(str);
+        } else {
+            // conversion failed (e.g. allocation failure); emit nil rather than
+            // leaving a gap in the byte stream
+            msgpack_pack_nil(pk);
         }
     }
     else if (mxIsCell(arr)) {
@@ -51,7 +81,10 @@ void pack_mxarray(msgpack_packer* pk, const mxArray* arr) {
         size_t num_elements = mxGetNumberOfElements(arr);
         int num_fields = mxGetNumberOfFields(arr);
 
-        if (num_elements > 1) {
+        // A scalar struct packs as a bare map; any other count (including an
+        // empty struct array) packs as an array of maps -- so a 0-element
+        // struct array becomes an empty array instead of emitting no bytes.
+        if (num_elements != 1) {
             msgpack_pack_array(pk, num_elements);
         }
 
@@ -69,8 +102,8 @@ void pack_mxarray(msgpack_packer* pk, const mxArray* arr) {
     else if (mxIsLogical(arr)) {
         size_t num_elements = mxGetNumberOfElements(arr);
         mxLogical* logic_data = mxGetLogicals(arr);
-        
-        if (num_elements > 1) {
+
+        if (num_elements != 1) {
             msgpack_pack_array(pk, num_elements);
         }
 
@@ -160,7 +193,7 @@ mxArray* unpack_msgpack(msgpack_object obj) {
             )
             {
                 mxArray* dbl_arr = mxCreateDoubleMatrix(1, size, mxREAL);
-                mxDouble* vals = mxGetDoubles(dbl_arr);
+                double* vals = (double*)mxGetData(dbl_arr);
 
                 for (uint32_t i = 0; i < size; i++) {
                     msgpack_object elem = obj.via.array.ptr[i];
@@ -216,44 +249,93 @@ mxArray* unpack_msgpack(msgpack_object obj) {
                 return bool_arr;
             }
 
-            // struct array
+            // struct array -- use the struct path only when the maps form a
+            // uniform, string-keyed struct: the template (first) map's keys are all
+            // strings of valid field-name length (<= 63), and every element is a map
+            // with that exact same set of keys. Anything else (non-string keys,
+            // over-long keys, or heterogeneous field sets) falls through to the
+            // generic cell array (jsondecode-style) so we never read a non-string
+            // key as a string, never hand an over-long name to mxCreateStructMatrix,
+            // and never silently drop a field that isn't in the template.
             if (first_type == MSGPACK_OBJECT_MAP) {
-                uint32_t num_fields = obj.via.array.ptr[0].via.map.size;
+                msgpack_object first_map = obj.via.array.ptr[0];
+                uint32_t num_fields = first_map.via.map.size;
 
-                const char** field_names = (const char**)mxMalloc(num_fields * sizeof(const char*));
+                int uniform = 1;
                 for (uint32_t f = 0; f < num_fields; f++) {
-                    msgpack_object key_obj = obj.via.array.ptr[0].via.map.ptr[f].key;
-                    char* fname = (char*)mxMalloc(key_obj.via.str.size + 1);
-                    memcpy(fname, key_obj.via.str.ptr, key_obj.via.str.size);
-                    fname[key_obj.via.str.size] = '\0';
-                    field_names[f] = fname;
-                }
-
-                mxArray* struct_arr = mxCreateStructMatrix(1, size, num_fields, field_names);
-
-                for (uint32_t i = 0; i < size; i++) {
-                    msgpack_object map_obj = obj.via.array.ptr[i];
-                    if (map_obj.type == MSGPACK_OBJECT_MAP) {
-                        for (uint32_t f = 0; f < map_obj.via.map.size; f++) {
-                            msgpack_object key_obj = map_obj.via.map.ptr[f].key;
-                            msgpack_object val_obj = map_obj.via.map.ptr[f].val;
-
-                            char temp_name[256] = {0};
-                            size_t len = key_obj.via.str.size < 255 ? key_obj.via.str.size : 255;
-                            memcpy(temp_name, key_obj.via.str.ptr, len);
-
-                            int field_num = mxGetFieldNumber(struct_arr, temp_name);
-                            if (field_num >= 0) {
-                                mxSetFieldByNumber(struct_arr, i, field_num, unpack_msgpack(val_obj));
-                            }
-                        }
+                    msgpack_object key = first_map.via.map.ptr[f].key;
+                    // valid MATLAB field names are 1..63 chars; anything else
+                    // (non-string, empty, or over-long) -> cell fallback
+                    if (key.type != MSGPACK_OBJECT_STR ||
+                        key.via.str.size == 0 || key.via.str.size > 63) {
+                        uniform = 0;
+                        break;
                     }
                 }
 
-                for (uint32_t f = 0; f < num_fields; f++) {
-                    mxFree((void*)field_names[f]);
+                if (uniform) {
+                    const char** field_names = (const char**)mxMalloc(num_fields * sizeof(const char*));
+                    for (uint32_t f = 0; f < num_fields; f++) {
+                        msgpack_object key_obj = first_map.via.map.ptr[f].key;
+                        char* fname = (char*)mxMalloc(key_obj.via.str.size + 1);
+                        memcpy(fname, key_obj.via.str.ptr, key_obj.via.str.size);
+                        fname[key_obj.via.str.size] = '\0';
+                        field_names[f] = fname;
+                    }
+
+                    // every element must be a map whose keys are exactly the
+                    // template's field set (order may differ); otherwise the array
+                    // is heterogeneous and is returned as a cell of structs instead
+                    for (uint32_t i = 0; i < size && uniform; i++) {
+                        msgpack_object m = obj.via.array.ptr[i];
+                        if (m.type != MSGPACK_OBJECT_MAP || m.via.map.size != num_fields) {
+                            uniform = 0;
+                            break;
+                        }
+                        for (uint32_t f = 0; f < num_fields; f++) {
+                            msgpack_object key = m.via.map.ptr[f].key;
+                            if (key.type != MSGPACK_OBJECT_STR) { uniform = 0; break; }
+                            int found = 0;
+                            for (uint32_t g = 0; g < num_fields; g++) {
+                                if (key.via.str.size == strlen(field_names[g]) &&
+                                    memcmp(key.via.str.ptr, field_names[g], key.via.str.size) == 0) {
+                                    found = 1;
+                                    break;
+                                }
+                            }
+                            if (!found) { uniform = 0; break; }
+                        }
+                    }
+
+                    if (uniform) {
+                        mxArray* struct_arr = mxCreateStructMatrix(1, size, num_fields, field_names);
+                        for (uint32_t i = 0; i < size; i++) {
+                            msgpack_object map_obj = obj.via.array.ptr[i];
+                            for (uint32_t f = 0; f < num_fields; f++) {
+                                msgpack_object key_obj = map_obj.via.map.ptr[f].key;
+                                msgpack_object val_obj = map_obj.via.map.ptr[f].val;
+
+                                char temp_name[64] = {0};   // keys validated <= 63
+                                memcpy(temp_name, key_obj.via.str.ptr, key_obj.via.str.size);
+
+                                int field_num = mxGetFieldNumber(struct_arr, temp_name);
+                                if (field_num >= 0) {
+                                    mxSetFieldByNumber(struct_arr, i, field_num, unpack_msgpack(val_obj));
+                                }
+                            }
+                        }
+                        for (uint32_t f = 0; f < num_fields; f++) {
+                            mxFree((void*)field_names[f]);
+                        }
+                        return struct_arr;
+                    }
+
+                    // heterogeneous after all -> release names and fall through
+                    for (uint32_t f = 0; f < num_fields; f++) {
+                        mxFree((void*)field_names[f]);
+                    }
+                    mxFree(field_names);
                 }
-                return struct_arr;
             }
 
             // fallback to cell array
@@ -276,6 +358,12 @@ mxArray* unpack_msgpack(msgpack_object obj) {
                     mexErrMsgIdAndTxt("msgpack:unpack:InvalidKey", "Struct fields must be strings.");
                 }
 
+                // MATLAB field names are capped at 63 chars; skip an over-long key
+                // rather than depend on mxAddField's handling of an invalid name
+                if (key_obj.via.str.size > 63) {
+                    continue;
+                }
+
                 char* field_name = (char*)mxMalloc(key_obj.via.str.size + 1);
                 memcpy(field_name, key_obj.via.str.ptr, key_obj.via.str.size);
                 field_name[key_obj.via.str.size] = '\0';
@@ -293,12 +381,12 @@ mxArray* unpack_msgpack(msgpack_object obj) {
         
         case MSGPACK_OBJECT_POSITIVE_INTEGER:
             mxArray* uint_out = mxCreateNumericMatrix(1, 1, mxUINT64_CLASS, mxREAL);
-            *((int64_t*)mxGetData(uint_out)) = obj.via.u64;
+            *((uint64_t*)mxGetData(uint_out)) = obj.via.u64;
             return uint_out;
-        
+
         case MSGPACK_OBJECT_NEGATIVE_INTEGER:
             mxArray* int_out = mxCreateNumericMatrix(1, 1, mxINT64_CLASS, mxREAL);
-            *((uint64_t*)mxGetData(int_out)) = obj.via.i64;
+            *((int64_t*)mxGetData(int_out)) = obj.via.i64;
             return int_out;
         
         case MSGPACK_OBJECT_BIN:
@@ -356,7 +444,13 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
         msgpack_unpacked msg;
         msgpack_unpacked_init(&msg);
 
-        if (msgpack_unpack_next(&msg, data, size, NULL)) {
+        // Only SUCCESS means a complete object was parsed. The old `if (ret)` test
+        // wrongly treated PARSE_ERROR (-1) and NOMEM_ERROR (-2) as success and fed
+        // garbage into unpack_msgpack; CONTINUE (0, truncated input) was the only
+        // value it rejected. With off == NULL the library returns SUCCESS even when
+        // trailing bytes follow the first object, so trailing data is still accepted
+        // and the first value returned.
+        if (msgpack_unpack_next(&msg, data, size, NULL) == MSGPACK_UNPACK_SUCCESS) {
             plhs[0] = unpack_msgpack(msg.data);
         } else {
             msgpack_unpacked_destroy(&msg);
