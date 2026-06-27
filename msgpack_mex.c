@@ -172,15 +172,16 @@ mxArray* unpack_msgpack(msgpack_object obj) {
         case MSGPACK_OBJECT_FLOAT32:
             return mxCreateDoubleScalar(obj.via.f64);
         
-        case MSGPACK_OBJECT_STR:
+        case MSGPACK_OBJECT_STR: {
             char* temp_str = (char*)mxMalloc(obj.via.str.size + 1);
             memcpy(temp_str, obj.via.str.ptr, obj.via.str.size);
             temp_str[obj.via.str.size] = '\0';
             mxArray* mx_str = mxCreateString(temp_str);
             mxFree(temp_str);
             return mx_str;
+        }
         
-        case MSGPACK_OBJECT_ARRAY:
+        case MSGPACK_OBJECT_ARRAY: {
             // TODO: handle booleans/integers
             uint32_t size = obj.via.array.size;
             if (!size) return mxCreateCellMatrix(1, 0);
@@ -344,8 +345,9 @@ mxArray* unpack_msgpack(msgpack_object obj) {
                 mxSetCell(cell_arr, i, unpack_msgpack(obj.via.array.ptr[i]));
             }
             return cell_arr;
-        
-        case MSGPACK_OBJECT_MAP:
+        }
+
+        case MSGPACK_OBJECT_MAP: {
             uint32_t map_size = obj.via.map.size;
             mxArray* struct_arr = mxCreateStructMatrix(1, 1, 0, NULL);
             
@@ -375,26 +377,30 @@ mxArray* unpack_msgpack(msgpack_object obj) {
                 mxFree(field_name);
             }
             return struct_arr;
-        
+        }
+
         case MSGPACK_OBJECT_BOOLEAN:
             return mxCreateLogicalScalar(obj.via.boolean);
         
-        case MSGPACK_OBJECT_POSITIVE_INTEGER:
+        case MSGPACK_OBJECT_POSITIVE_INTEGER: {
             mxArray* uint_out = mxCreateNumericMatrix(1, 1, mxUINT64_CLASS, mxREAL);
             *((uint64_t*)mxGetData(uint_out)) = obj.via.u64;
             return uint_out;
+        }
 
-        case MSGPACK_OBJECT_NEGATIVE_INTEGER:
+        case MSGPACK_OBJECT_NEGATIVE_INTEGER: {
             mxArray* int_out = mxCreateNumericMatrix(1, 1, mxINT64_CLASS, mxREAL);
             *((int64_t*)mxGetData(int_out)) = obj.via.i64;
             return int_out;
-        
-        case MSGPACK_OBJECT_BIN:
+        }
+
+        case MSGPACK_OBJECT_BIN: {
             mxArray* bin_arr = mxCreateNumericMatrix(1, obj.via.bin.size, mxUINT8_CLASS, mxREAL);
             memcpy(mxGetData(bin_arr), obj.via.bin.ptr, obj.via.bin.size);
             return bin_arr;
-        
-        case MSGPACK_OBJECT_EXT:
+        }
+
+        case MSGPACK_OBJECT_EXT: {
             const char* ext_fields[] = {"type", "data"};
             mxArray* ext_struct = mxCreateStructMatrix(1, 1, 2, ext_fields);
             mxArray* type_arr = mxCreateNumericMatrix(1, 1, mxINT8_CLASS, mxREAL);
@@ -406,6 +412,7 @@ mxArray* unpack_msgpack(msgpack_object obj) {
             mxSetFieldByNumber(ext_struct, 0, 1, data_arr);
 
             return ext_struct;
+        }
 
         default:
             mexErrMsgIdAndTxt("msgpack:unpack:UnsupportedType", "Unsupported msgpack type.");
