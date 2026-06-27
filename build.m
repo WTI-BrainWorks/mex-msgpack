@@ -11,13 +11,16 @@ function build()
     is_octave = exist('OCTAVE_VERSION', 'builtin') ~= 0;
 
     % --- build the static msgpack-c library from the submodule ---
-    % Pin CMAKE_INSTALL_LIBDIR=lib so the archive always lands in inst/lib --
-    % msgpack-c uses GNUInstallDirs, which would otherwise install to inst/lib64
-    % on multilib distros (Fedora/RHEL/SUSE) and break the libfile lookup below.
-    cfg = ['cmake -S msgpack-c -B build -DCMAKE_BUILD_TYPE=Release ' ...
-           '-DCMAKE_INSTALL_PREFIX=./inst -DCMAKE_INSTALL_LIBDIR=lib ' ...
-           '-DMSGPACK_ENABLE_STATIC=ON -DMSGPACK_ENABLE_SHARED=OFF ' ...
-           '-DMSGPACK_BUILD_EXAMPLES=OFF'];
+    % Configure with the classic "cmake <flags> <source>" form, run from the
+    % build dir via `cmake -E chdir`, rather than `-S/-B` (which needs CMake
+    % >= 3.13 -- the Octave 4.4 image ships CMake 3.10). CMAKE_INSTALL_LIBDIR is
+    % pinned to lib because GNUInstallDirs would otherwise pick lib64 on multilib
+    % distros (Fedora/RHEL/SUSE) and break the libfile lookup below.
+    if ~exist('build', 'dir'); mkdir('build'); end
+    cfg = ['cmake -E chdir build cmake ' ...
+           '-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=../inst ' ...
+           '-DCMAKE_INSTALL_LIBDIR=lib -DMSGPACK_ENABLE_STATIC=ON ' ...
+           '-DMSGPACK_ENABLE_SHARED=OFF -DMSGPACK_BUILD_EXAMPLES=OFF'];
     gen = getenv('MEX_CMAKE_GENERATOR');
     if ~isempty(gen)
         cfg = [cfg ' -G "' gen '"'];
@@ -28,16 +31,21 @@ function build()
         % generator refuses to run while sh.exe is on PATH.
         cfg = [cfg ' -G "MinGW Makefiles"'];
     end
+    cfg = [cfg ' ../msgpack-c'];   % source dir, positional (classic form)
+
     % A build/ left over from a different generator makes cmake refuse to
     % reconfigure ("does not match the generator used previously"); on a
     % configure failure, wipe build/ and try once more.
     if system(cfg) ~= 0
         fprintf('cmake configure failed; wiping build/ and retrying...\n');
         if exist('build', 'dir'); rmdir('build', 's'); end
+        mkdir('build');
         run_cmd(cfg);
     end
+    % `cmake --install` needs CMake >= 3.15; `--build --target install` is the
+    % portable equivalent that also works with the 4.4 image's CMake 3.10.
     run_cmd('cmake --build build --config Release');
-    run_cmd('cmake --install build');
+    run_cmd('cmake --build build --target install --config Release');
 
     % --- locate the installed static library ---
     if ispc && ~is_octave
