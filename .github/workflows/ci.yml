@@ -1,112 +1,162 @@
-name: build
+name: CI
+
+# Strategy: BUILD on the oldest supported version, then TEST that exact binary on
+# newer versions (forward-compatibility), and RELEASE only the floor-built
+# binaries. Rationale:
+#   * MATLAB mex is forward-compatible (built on an older release runs on newer),
+#     so one floor build per OS covers all newer MATLAB.
+#   * Octave has two binary-compatible eras, so we build one mex per era:
+#       - 6.4 build  -> SONAME-free mex; loads on Octave 6.4-9.4 (Psychtoolbox's
+#         range). Rejected by 10+, which expects a SOVERSION stamp.
+#       - 10.1 build -> links the new liboctmex, whose SOVERSION is "stable across
+#         multiple major versions" per the Octave 10 release notes, so it covers
+#         10 -> latest. (The 11 forward-test confirms that claim empirically.)
+#     Octave 4.4's old mkoctfile hard-linked liboctinterp (version-locked, below
+#     our floor) -- it still builds from source, just isn't a distributed binary.
+#     See https://octave.org/NEWS-10.html.
+#
+# Building on each floor is also our compile-time coverage: the floor toolchains
+# (gcc 9.4 on Octave 6.4, etc.) are what catch source-level breakage that a
+# forward-test of a prebuilt binary never would. msgpack-c is a pinned submodule;
+# BUILD jobs check it out + compile it via CMake, TEST jobs don't need it (the
+# MEX statically links it, no rebuild).
 
 on:
   push:
     branches: [main]
+    tags: ['v*']          # pushing a v* tag also publishes a GitHub Release
   pull_request:
   workflow_dispatch:
 
 jobs:
-  # ----------------------------------------------------------------- MATLAB
-  matlab:
-    name: MATLAB ${{ matrix.release }} / ${{ matrix.os }}
+  # =============================================================== MATLAB =====
+  # Build on the floor release per OS (R2022b is the first to support VS2022 on
+  # hosted runners), then forward-test that binary on the latest MATLAB.
+  matlab-build:
+    name: build · ${{ matrix.os }} · MATLAB ${{ matrix.release }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  release: latest }
-          - { os: windows-latest, release: latest }
-          - { os: windows-2022,   release: R2022b }   # first MATLAB supporting VS2022 on hosted runners
-          - { os: ubuntu-22.04,   release: R2021b }
+          - { os: ubuntu-22.04, release: R2021b, asset: msgpack-matlab-linux }
+          - { os: windows-2022, release: R2022b, asset: msgpack-matlab-windows }
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-
-      - name: Set up MATLAB ${{ matrix.release }}
-        uses: matlab-actions/setup-matlab@v3
+      - uses: matlab-actions/setup-matlab@v3
         with:
           release: ${{ matrix.release }}
-
-      - name: Build MEX
+      - name: Build
         uses: matlab-actions/run-command@v3
         env:
           MLM_LICENSE_TOKEN: ${{ secrets.MLM_LICENSE_TOKEN }}   # only needed for private repos
         with:
           command: build
+      - name: Test
+        uses: matlab-actions/run-command@v3
+        env:
+          MLM_LICENSE_TOKEN: ${{ secrets.MLM_LICENSE_TOKEN }}
+        with:
+          command: run_tests
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist              # msgpack.<mex> + the msgpack.m help shim
+          if-no-files-found: error
 
-      - name: Run tests
+  matlab-test-forward:
+    name: test · ${{ matrix.os }} · MATLAB ${{ matrix.release }}
+    needs: matlab-build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  release: latest, asset: msgpack-matlab-linux }
+          - { os: windows-latest, release: latest, asset: msgpack-matlab-windows }
+    steps:
+      - uses: actions/checkout@v7   # run_tests.m + dist/msgpack.m (no rebuild, no submodule)
+      - uses: matlab-actions/setup-matlab@v3
+        with:
+          release: ${{ matrix.release }}
+      - name: Fetch floor-built package
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.asset }}
+          path: dist                # overlays the floor-built MEX into dist/
+      - name: Test floor binary (no rebuild)
         uses: matlab-actions/run-command@v3
         env:
           MLM_LICENSE_TOKEN: ${{ secrets.MLM_LICENSE_TOKEN }}
         with:
           command: run_tests
 
-      - name: Upload MEX
-        uses: actions/upload-artifact@v7
-        with:
-          name: matlab-${{ matrix.release }}-${{ matrix.os }}
-          path: |
-            dist/msgpack.mex*
-            dist/msgpack.m
-          if-no-files-found: error
-
-  # ----------------------------------------------------- Octave (Linux, pinned)
-  # Builds inside the gnuoctave/octave images so the Octave version is exact and
-  # reproducible. 7.3.0 is the production target; 4.4.1 is the oldest we support
-  # (Psychtoolbox's floor); `latest` catches forward-compat breakage. We check
-  # out on the host and run the build via `docker run` (rather than a job-level
-  # `container:`) so the old 4.4.1 image's glibc doesn't have to satisfy the
-  # Node-based actions/checkout runtime.
-  octave-linux:
-    name: Octave ${{ matrix.octave }} / linux
+  # =============================================================== Octave =====
+  # One mex per binary-compatible era (see header): 6.4 build -> Octave 6.4-9.4,
+  # 10.1 build -> Octave 10 -> latest (liboctmex). Build each floor, forward-test
+  # that exact binary on newer versions in its era, and ship both.
+  octave-build:
+    name: build · linux · Octave ${{ matrix.floor }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        octave: ['4.4.1', '7.3.0', 'latest']
+        include:
+          - { floor: '6.4.0',  asset: msgpack-octave-linux-6.4 }   # covers Octave 6.4-9.4
+          - { floor: '10.1.0', asset: msgpack-octave-linux-10 }    # covers Octave 10 -> latest
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-
-      - name: Build + test (Octave ${{ matrix.octave }})
+      - name: Build & test
         run: |
-          docker run --rm -v "$PWD:/work" -w /work gnuoctave/octave:${{ matrix.octave }} bash -c '
-            set -e
-            # The images ship gcc/g++/make but not cmake. The oldest (4.4.1 =
-            # Ubuntu 16.04) also has no python/pip and EOL apt repos, so neither
-            # the PyPI cmake wheel nor apt is reliable there. They do have
-            # curl/wget + tar, and the Kitware cmake binary needs only glibc 2.17,
-            # so fetch a pinned cmake whenever the image lacks one.
-            if ! command -v cmake >/dev/null 2>&1; then
-              v=3.29.0
-              url="https://github.com/Kitware/CMake/releases/download/v${v}/cmake-${v}-linux-x86_64.tar.gz"
-              mkdir -p /opt
-              if command -v curl >/dev/null 2>&1; then curl -fsSL "$url" -o /tmp/cmake.tgz; else wget -qO /tmp/cmake.tgz "$url"; fi
-              tar -xzf /tmp/cmake.tgz -C /opt
-              export PATH="/opt/cmake-${v}-linux-x86_64/bin:$PATH"
-            fi
-            cmake --version
-            octave --no-gui --eval "build"
-            octave --no-gui --eval "run_tests"
-          '
-
-      - name: Upload MEX
+          docker run --rm -i -v "$PWD:/work" -w /work "gnuoctave/octave:${{ matrix.floor }}" bash -s <<'EOF'
+          command -v cmake >/dev/null 2>&1 || { apt-get update && apt-get install -y --no-install-recommends cmake build-essential; }
+          octave --no-gui --eval "build" && octave --no-gui --eval "run_tests"
+          status=$?
+          # container runs as root; make the MEX readable by the runner user for upload
+          chmod -R a+rX /work/dist || true
+          exit $status
+          EOF
+      - name: Upload package
         uses: actions/upload-artifact@v7
         with:
-          name: octave-${{ matrix.octave }}-linux
-          path: |
-            dist/msgpack.mex
-            dist/msgpack.m
+          name: ${{ matrix.asset }}
+          path: dist
           if-no-files-found: error
 
-  # --------------------------------------------------------- Octave (Windows)
-  # MSYS2 only ships the current Octave, so this isn't version-pinned; it guards
-  # the Windows/MinGW build path. (Linux above pins the production 7.3.0.)
+  octave-test-forward:
+    name: test · linux · Octave ${{ matrix.octave }} (from ${{ matrix.asset }})
+    needs: octave-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { asset: msgpack-octave-linux-6.4, octave: '7.3.0'  }
+          - { asset: msgpack-octave-linux-6.4, octave: '9.4.0'  }   # top of the 6.x era
+          - { asset: msgpack-octave-linux-10,  octave: '10.3.0' }
+          - { asset: msgpack-octave-linux-10,  octave: '11.3.0' }   # confirms liboctmex spans 10->11
+    steps:
+      - uses: actions/checkout@v7   # run_tests.m + dist/msgpack.m (no rebuild, no submodule)
+      - name: Fetch built package
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.asset }}
+          path: dist
+      - name: Test on Octave ${{ matrix.octave }} (no rebuild)
+        run: |
+          docker run --rm -i -v "$PWD:/work" -w /work "gnuoctave/octave:${{ matrix.octave }}" bash -s <<'EOF'
+          octave --no-gui --eval "run_tests"
+          EOF
+
+  # MSYS2 is rolling, so we can't pin an old Octave here: build + test + ship the
+  # current one.
   octave-windows:
-    name: Octave / windows-latest
+    name: build · windows · Octave (MSYS2)
     runs-on: windows-latest
     defaults:
       run:
@@ -115,8 +165,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-
-      - name: Set up MSYS2 / Octave
+      - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -126,20 +175,49 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
-
-      - name: Build MEX
+      - name: Build & test
         env:
-          MEX_CMAKE_GENERATOR: Ninja
-        run: octave --no-gui --eval "build"
-
-      - name: Run tests
-        run: octave --no-gui --eval "run_tests"
-
-      - name: Upload MEX
+          MEX_CMAKE_GENERATOR: Ninja   # MinGW: cmake's "MinGW Makefiles" rejects sh.exe on PATH
+        run: |
+          octave --no-gui --eval "build"
+          octave --no-gui --eval "run_tests"
+      - name: Upload package
         uses: actions/upload-artifact@v7
         with:
-          name: octave-windows-latest
-          path: |
-            dist/msgpack.mex
-            dist/msgpack.m
+          name: msgpack-octave-windows
+          path: dist
           if-no-files-found: error
+
+  # ============================================================== Release =====
+  # On a v* tag, publish the floor-built packages (one per platform/engine/era)
+  # as a GitHub Release. Runs only after every build + forward-test passes, so a
+  # release implies the shipped binaries are confirmed forward-compatible.
+  release:
+    name: Publish release
+    needs: [matlab-build, matlab-test-forward, octave-build, octave-test-forward, octave-windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: msgpack-*       # the floor-built / shipped packages
+      - name: Zip each package
+        run: |
+          cd dist
+          for d in */; do
+            name="${d%/}"
+            (cd "$d" && zip -qr "../${name}.zip" .)
+          done
+          ls -la *.zip
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/*.zip \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
