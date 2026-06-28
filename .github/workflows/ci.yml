@@ -47,7 +47,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: matlab-${{ matrix.release }}-${{ matrix.os }}
-          path: dist/msgpack.mex*
+          path: |
+            dist/msgpack.mex*
+            dist/msgpack.m
           if-no-files-found: error
 
   # ----------------------------------------------------- Octave (Linux, pinned)
@@ -95,7 +97,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: octave-${{ matrix.octave }}-linux
-          path: dist/msgpack.mex
+          path: |
+            dist/msgpack.mex
+            dist/msgpack.m
           if-no-files-found: error
 
   # --------------------------------------------------------- Octave (Windows)
@@ -135,5 +139,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: octave-windows-latest
-          path: dist/msgpack.mex
+          path: |
+            dist/msgpack.mex
+            dist/msgpack.m
           if-no-files-found: error
