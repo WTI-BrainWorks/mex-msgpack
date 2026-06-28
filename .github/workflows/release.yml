@@ -1,0 +1,213 @@
+name: release
+
+# On a version tag, build each distributable MEX ONCE on the OLDEST version that
+# yields a forward-portable binary, verify it forward on newer versions, then
+# attach one per-platform zip to a GitHub Release. A portable MEX links only libc
+# and resolves mx*/mex* from the host at load. NOTE: Octave only stopped baking a
+# version-locked liboctinterp dependency into MEX files at 6.4, so the Octave
+# binary floor is 6.4 -- 4.4/5.x users build from source (CI proves 4.4 builds).
+# The forward-test jobs map the actual ceiling. (CI still builds every version,
+# incl. 4.4.1, for compile-time coverage; this only governs what we distribute.)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:   # build/test dry run (the release job is gated to tags)
+
+permissions:
+  contents: write      # create the release / upload assets
+
+jobs:
+  # ====================== MATLAB: build oldest, test forward ==================
+  matlab-build:
+    name: MATLAB build ${{ matrix.release }} / ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, platform: linux,   release: R2021b }
+          - { os: windows-2022, platform: windows, release: R2022b }   # first MATLAB w/ VS2022 on hosted runners
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: matlab-actions/setup-matlab@v3
+        with:
+          release: ${{ matrix.release }}
+      - name: Build
+        uses: matlab-actions/run-command@v3
+        env:
+          MLM_LICENSE_TOKEN: ${{ secrets.MLM_LICENSE_TOKEN }}
+        with:
+          command: build
+      - name: Test
+        uses: matlab-actions/run-command@v3
+        env:
+          MLM_LICENSE_TOKEN: ${{ secrets.MLM_LICENSE_TOKEN }}
+        with:
+          command: run_tests
+      - name: Stage
+        shell: bash
+        run: |
+          mkdir staged
+          cp dist/msgpack.mex* staged/
+          cp dist/msgpack.m staged/ 2>/dev/null || echo "note: dist/msgpack.m absent, shipping binary only"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: matlab-${{ matrix.platform }}
+          path: staged/*
+          if-no-files-found: error
+
+  matlab-test-forward:
+    name: MATLAB test latest / ${{ matrix.platform }}
+    needs: matlab-build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  platform: linux }
+          - { os: windows-latest, platform: windows }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: matlab-actions/setup-matlab@v3   # latest
+      - name: Fetch the oldest-built MEX
+        uses: actions/download-artifact@v8
+        with:
+          name: matlab-${{ matrix.platform }}
+          path: dist
+      - name: Test prebuilt MEX on latest MATLAB
+        uses: matlab-actions/run-command@v3
+        env:
+          MLM_LICENSE_TOKEN: ${{ secrets.MLM_LICENSE_TOKEN }}
+        with:
+          command: run_tests
+
+  # ====================== Octave: build oldest, test forward ==================
+  octave-build:
+    name: Octave build 6.4.0 / linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      # 6.4.0 is the oldest Octave whose MEX has no version-locked liboctinterp
+      # dependency, so the binary it produces is forward-portable to 7.3/latest.
+      - name: Build + test in gnuoctave/octave:6.4.0
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work gnuoctave/octave:6.4.0 bash -c '
+            set -e
+            if ! command -v cmake >/dev/null 2>&1; then
+              v=3.29.0
+              url="https://github.com/Kitware/CMake/releases/download/v${v}/cmake-${v}-linux-x86_64.tar.gz"
+              mkdir -p /opt
+              if command -v curl >/dev/null 2>&1; then curl -fsSL "$url" -o /tmp/cmake.tgz; else wget -qO /tmp/cmake.tgz "$url"; fi
+              tar -xzf /tmp/cmake.tgz -C /opt
+              export PATH="/opt/cmake-${v}-linux-x86_64/bin:$PATH"
+            fi
+            octave --no-gui --eval "build"
+            octave --no-gui --eval "run_tests"
+            chmod -R a+rX dist
+          '
+      - name: Stage
+        run: |
+          mkdir staged
+          cp dist/msgpack.mex* staged/
+          cp dist/msgpack.m staged/ 2>/dev/null || echo "note: dist/msgpack.m absent, shipping binary only"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: octave-linux
+          path: staged/*
+          if-no-files-found: error
+
+  octave-test-forward:
+    name: Octave test ${{ matrix.octave }} / linux
+    needs: octave-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        octave: ['7.3.0', 'latest']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Fetch the 4.4.1-built MEX
+        uses: actions/download-artifact@v8
+        with:
+          name: octave-linux
+          path: dist
+      - name: Test prebuilt 4.4.1 MEX on Octave ${{ matrix.octave }}
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work gnuoctave/octave:${{ matrix.octave }} \
+            octave --no-gui --eval "run_tests"
+
+  # Octave on Windows: MSYS2 ships only the current Octave, so there's no "older"
+  # build to make -- build + test + ship the current one.
+  octave-windows:
+    name: Octave / windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-octave
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+      - name: Build + test
+        env:
+          MEX_CMAKE_GENERATOR: Ninja
+        run: |
+          octave --no-gui --eval "build"
+          octave --no-gui --eval "run_tests"
+      - name: Stage
+        run: |
+          mkdir staged
+          cp dist/msgpack.mex* staged/
+          cp dist/msgpack.m staged/ 2>/dev/null || echo "note: dist/msgpack.m absent, shipping binary only"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: octave-windows
+          path: staged/*
+          if-no-files-found: error
+
+  # ====================== publish per-platform zips ===========================
+  release:
+    name: Publish release
+    needs: [matlab-build, matlab-test-forward, octave-build, octave-test-forward, octave-windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the build artifacts (test-forward jobs upload nothing)
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Package per-platform zips
+        run: |
+          mkdir -p release
+          for d in artifacts/*/; do
+            name=$(basename "$d")
+            # -j flattens paths, so each zip holds msgpack.<ext> (+ msgpack.m) at
+            # the root regardless of how the artifact was nested
+            find "$d" -type f -exec zip -j "$GITHUB_WORKSPACE/release/msgpack-${name}.zip" {} +
+          done
+          ls -la release/
+      - name: Create / update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/*.zip \
+            --title "$GITHUB_REF_NAME" --generate-notes \
+            || gh release upload "$GITHUB_REF_NAME" release/*.zip --clobber
